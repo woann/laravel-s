@@ -6,22 +6,24 @@
     "issues": "https://github.com/hhxsv5/laravel-s/issues",
     "source": "https://github.com/hhxsv5/laravel-s"
   },
-  "description": "🚀 LaravelS: speed up Laravel/Lumen by Swoole, let's fly.",
+  "description": "🚀LaravelS is a glue that is used to quickly integrate Swoole into Laravel or Lumen and then give them better performance and more possibilities.",
   "keywords": [
-    "LaravelS",
+    "laravel-s",
     "swoole",
+    "laravel",
+    "lumen",
+    "async",
     "coroutine",
-    "http server",
-    "websocket server",
-    "tcp server",
-    "udp server",
-    "async task",
-    "async event",
-    "custom process",
+    "server",
+    "http",
+    "websocket",
+    "tcp",
+    "udp",
+    "process",
+    "task",
     "timer",
-    "inotify reload",
-    "memory resident",
-    "high performance"
+    "inotify",
+    "performance"
   ],
   "homepage": "https://github.com/hhxsv5/laravel-s",
   "authors": [
@@ -49,6 +51,9 @@
       ]
     }
   },
+  "bin": [
+    "bin/fswatch"
+  ],
   "prefer-stable": true,
   "minimum-stability": "dev"
 }

@@ -33,7 +33,7 @@ class Server
 
         $ip = isset($conf['listen_ip']) ? $conf['listen_ip'] : '127.0.0.1';
         $port = isset($conf['listen_port']) ? $conf['listen_port'] : 5200;
-        $socketType = isset($conf['socket_type']) ? $conf['socket_type'] : \SWOOLE_SOCK_TCP;
+        $socketType = isset($conf['socket_type']) ? (int)$conf['socket_type'] : \SWOOLE_SOCK_TCP;
 
         if ($socketType === \SWOOLE_SOCK_UNIX_STREAM) {
             $socketDir = dirname($ip);
@@ -71,6 +71,7 @@ class Server
         $this->swoole->on('WorkerStart', [$this, 'onWorkerStart']);
         $this->swoole->on('WorkerStop', [$this, 'onWorkerStop']);
         $this->swoole->on('WorkerError', [$this, 'onWorkerError']);
+        $this->swoole->on('PipeMessage', [$this, 'onPipeMessage']);
     }
 
     protected function bindHttpEvent()
@@ -90,11 +91,9 @@ class Server
     {
         if ($this->enableWebSocket) {
             $eventHandler = function ($method, array $params) {
-                try {
+                $this->callWithCatchException(function () use ($method, $params) {
                     call_user_func_array([$this->getWebSocketHandler(), $method], $params);
-                } catch (\Exception $e) {
-                    $this->logException($e);
-                }
+                });
             };
 
             $this->swoole->on('Open', function () use ($eventHandler) {
@@ -132,11 +131,9 @@ class Server
             $eventHandler = function ($method, array $params) use ($port, $handlerClass) {
                 $handler = $this->getSocketHandler($port, $handlerClass);
                 if (method_exists($handler, $method)) {
-                    try {
+                    $this->callWithCatchException(function () use ($handler, $method, $params) {
                         call_user_func_array([$handler, $method], $params);
-                    } catch (\Exception $e) {
-                        $this->logException($e);
-                    }
+                    });
                 }
             };
             static $events = [
@@ -241,6 +238,9 @@ class Server
             $process = 'task worker';
         } else {
             $process = 'worker';
+            if (!empty($this->conf['enable_coroutine_runtime'])) {
+                \Swoole\Runtime::enableCoroutine();
+            }
         }
         $this->setProcessTitle(sprintf('%s laravels: %s process %d', $this->conf['process_prefix'], $process, $workerId));
 
@@ -264,6 +264,13 @@ class Server
         $this->log(sprintf('worker[%d] error: exitCode=%s, signal=%s', $workerId, $exitCode, $signal), 'ERROR');
     }
 
+    public function onPipeMessage(\swoole_http_server $server, $srcWorkerId, $message)
+    {
+        if ($message instanceof Task) {
+            $this->onTask($server, uniqid('', true), $srcWorkerId, $message);
+        }
+    }
+
     public function onRequest(\swoole_http_request $request, \swoole_http_response $response)
     {
 
@@ -274,8 +281,7 @@ class Server
         if ($data instanceof Event) {
             $this->handleEvent($data);
         } elseif ($data instanceof Task) {
-            $this->handleTask($data);
-            if (method_exists($data, 'finish')) {
+            if ($this->handleTask($data) && method_exists($data, 'finish')) {
                 return $data;
             }
         }
@@ -284,8 +290,7 @@ class Server
     public function onFinish(\swoole_http_server $server, $taskId, $data)
     {
         if ($data instanceof Task) {
-            $data->/** @scrutinizer ignore-call */
-            finish();
+            $data->finish();
         }
     }
 
@@ -308,21 +313,18 @@ class Server
             if (!($listener instanceof Listener)) {
                 throw new \Exception(sprintf('%s must extend the abstract class %s', $listenerClass, Listener::class));
             }
-            try {
+            $this->callWithCatchException(function () use ($listener, $event) {
                 $listener->handle($event);
-            } catch (\Exception $e) {
-                $this->logException($e);
-            }
+            });
         }
     }
 
     protected function handleTask(Task $task)
     {
-        try {
+        return $this->callWithCatchException(function () use ($task) {
             $task->handle();
-        } catch (\Exception $e) {
-            $this->logException($e);
-        }
+            return true;
+        });
     }
 
     public function run()

@@ -3,6 +3,7 @@
 namespace Hhxsv5\LaravelS;
 
 use Hhxsv5\LaravelS\Illuminate\Laravel;
+use Hhxsv5\LaravelS\Swoole\Coroutine\Context;
 use Hhxsv5\LaravelS\Swoole\DynamicResponse;
 use Hhxsv5\LaravelS\Swoole\Request;
 use Hhxsv5\LaravelS\Swoole\Server;
@@ -28,8 +29,9 @@ class LaravelS extends Server
      * Fix conflicts of traits
      */
     use InotifyTrait, LaravelTrait, LogTrait, ProcessTitleTrait, TimerTrait, CustomProcessTrait {
-        LogTrait::log insteadof InotifyTrait, TimerTrait;
-        LogTrait::logException insteadof InotifyTrait, TimerTrait;
+        LogTrait::log insteadof InotifyTrait, TimerTrait, CustomProcessTrait;
+        LogTrait::logException insteadof InotifyTrait, TimerTrait, CustomProcessTrait;
+        LogTrait::callWithCatchException insteadof InotifyTrait, TimerTrait, CustomProcessTrait;
         ProcessTitleTrait::setProcessTitle insteadof InotifyTrait, TimerTrait, CustomProcessTrait;
         LaravelTrait::initLaravel insteadof TimerTrait, CustomProcessTrait;
     }
@@ -51,7 +53,9 @@ class LaravelS extends Server
         $this->swoole->timerProcess = $this->addTimerProcess($this->swoole, $timerCfg, $this->laravelConf);
 
         $inotifyCfg = isset($this->conf['inotify_reload']) ? $this->conf['inotify_reload'] : [];
-        $inotifyCfg['root_path'] = $this->laravelConf['root_path'];
+        if (!isset($inotifyCfg['watch_path'])) {
+            $inotifyCfg['watch_path'] = $this->laravelConf['root_path'];
+        }
         $inotifyCfg['process_prefix'] = $svrConf['process_prefix'];
         $this->swoole->inotifyProcess = $this->addInotifyProcess($this->swoole, $inotifyCfg);
 
@@ -61,35 +65,23 @@ class LaravelS extends Server
 
     protected function bindWebSocketEvent()
     {
+        parent::bindWebSocketEvent();
+
         if ($this->enableWebSocket) {
             $eventHandler = function ($method, array $params) {
-                try {
+                $this->callWithCatchException(function () use ($method, $params) {
                     call_user_func_array([$this->getWebSocketHandler(), $method], $params);
-                } catch (\Exception $e) {
-                    $this->logException($e);
-                }
+                });
             };
 
             $this->swoole->on('Open', function (\swoole_websocket_server $server, \swoole_http_request $request) use ($eventHandler) {
                 // Start Laravel's lifetime, then support session ...middleware.
                 $this->laravel->resetSession();
-                $laravelRequest = $this->convertRequest($request);
+                $laravelRequest = $this->convertRequest($this->laravel, $request);
                 $this->laravel->bindRequest($laravelRequest);
                 $this->laravel->handleDynamic($laravelRequest);
                 $eventHandler('onOpen', func_get_args());
                 $this->laravel->saveSession();
-            });
-
-            $this->swoole->on('Message', function () use ($eventHandler) {
-                $eventHandler('onMessage', func_get_args());
-            });
-
-            $this->swoole->on('Close', function (\swoole_websocket_server $server, $fd, $reactorId) use ($eventHandler) {
-                $clientInfo = $server->getClientInfo($fd);
-                if (isset($clientInfo['websocket_status']) && $clientInfo['websocket_status'] === \WEBSOCKET_STATUS_FRAME) {
-                    $eventHandler('onClose', func_get_args());
-                }
-                // else ignore the close event for http server
             });
         }
     }
@@ -104,9 +96,9 @@ class LaravelS extends Server
         $this->laravel = $this->initLaravel($this->laravelConf, $this->swoole);
     }
 
-    protected function convertRequest(\swoole_http_request $request)
+    protected function convertRequest(Laravel $laravel, \swoole_http_request $request)
     {
-        $rawGlobals = $this->laravel->getRawGlobals();
+        $rawGlobals = $laravel->getRawGlobals();
         $server = isset($rawGlobals['_SERVER']) ? $rawGlobals['_SERVER'] : [];
         $env = isset($rawGlobals['_ENV']) ? $rawGlobals['_ENV'] : [];
         return (new Request($request))->toIlluminateRequest($server, $env);
@@ -114,13 +106,14 @@ class LaravelS extends Server
 
     public function onRequest(\swoole_http_request $request, \swoole_http_response $response)
     {
+        parent::onRequest($request, $response);
         try {
-            $laravelRequest = $this->convertRequest($request);
+            $laravelRequest = $this->convertRequest($this->laravel, $request);
             $this->laravel->bindRequest($laravelRequest);
             $this->laravel->fireEvent('laravels.received_request', [$laravelRequest]);
-            $success = $this->handleStaticResource($laravelRequest, $response);
+            $success = $this->handleStaticResource($this->laravel, $laravelRequest, $response);
             if ($success === false) {
-                $this->handleDynamicResource($laravelRequest, $response);
+                $this->handleDynamicResource($this->laravel, $laravelRequest, $response);
             }
         } catch (\Exception $e) {
             $this->handleException($e, $response);
@@ -145,14 +138,14 @@ class LaravelS extends Server
         }
     }
 
-    protected function handleStaticResource(IlluminateRequest $laravelRequest, \swoole_http_response $swooleResponse)
+    protected function handleStaticResource(Laravel $laravel, IlluminateRequest $laravelRequest, \swoole_http_response $swooleResponse)
     {
         // For Swoole < 1.9.17
         if (!empty($this->conf['handle_static'])) {
-            $laravelResponse = $this->laravel->handleStatic($laravelRequest);
+            $laravelResponse = $laravel->handleStatic($laravelRequest);
             if ($laravelResponse !== false) {
                 $laravelResponse->headers->set('Server', $this->conf['server'], true);
-                $this->laravel->fireEvent('laravels.generated_response', [$laravelRequest, $laravelResponse]);
+                $laravel->fireEvent('laravels.generated_response', [$laravelRequest, $laravelResponse]);
                 (new StaticResponse($swooleResponse, $laravelResponse))->send($this->conf['enable_gzip']);
                 return true;
             }
@@ -160,12 +153,12 @@ class LaravelS extends Server
         return false;
     }
 
-    protected function handleDynamicResource(IlluminateRequest $laravelRequest, \swoole_http_response $swooleResponse)
+    protected function handleDynamicResource(Laravel $laravel, IlluminateRequest $laravelRequest, \swoole_http_response $swooleResponse)
     {
-        $laravelResponse = $this->laravel->handleDynamic($laravelRequest);
+        $laravelResponse = $laravel->handleDynamic($laravelRequest);
         $laravelResponse->headers->set('Server', $this->conf['server'], true);
-        $this->laravel->fireEvent('laravels.generated_response', [$laravelRequest, $laravelResponse]);
-        $this->laravel->cleanRequest($laravelRequest);
+        $laravel->fireEvent('laravels.generated_response', [$laravelRequest, $laravelResponse]);
+        $laravel->cleanRequest($laravelRequest);
         if ($laravelResponse instanceof BinaryFileResponse) {
             (new StaticResponse($swooleResponse, $laravelResponse))->send($this->conf['enable_gzip']);
         } else {

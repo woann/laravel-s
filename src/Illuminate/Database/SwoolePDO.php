@@ -15,16 +15,29 @@ class SwoolePDO extends \PDO
         $this->sm = new SwooleMySQL();
     }
 
+    /**
+     * @param array $serverInfo
+     * @throws ConnectionException
+     */
     public function connect(array $serverInfo)
     {
         $this->sm->connect($serverInfo);
+
+        if ($this->sm->connected === false) {
+            $msg = sprintf('Cannot connect to the database: %s',
+                $this->sm->connect_errno ? $this->sm->connect_error : $this->sm->error
+            );
+            $code = $this->sm->connect_errno ?: $this->sm->errno;
+            throw new ConnectionException($msg, $code);
+        }
+
     }
 
     public function prepare($statement, $options = null)
     {
         $swStatement = $this->sm->prepare($statement);
         if ($swStatement === false) {
-            throw new QueryException($statement, [], new \Exception($this->sm->error, $this->sm->errno));
+            throw new QueryException($statement, [], new StatementException($this->sm->error, $this->sm->errno));
         }
         return new SwoolePDOStatement($swStatement);
     }
@@ -49,7 +62,11 @@ class SwoolePDO extends \PDO
 
     public function query($statement, $mode = \PDO::ATTR_DEFAULT_FETCH_MODE, $arg3 = null, array $ctorargs = [])
     {
-        return $this->sm->query($statement, array_get($ctorargs, 'timeout', 0.0));
+        $result = $this->sm->query($statement, array_get($ctorargs, 'timeout', 0.0));
+        if ($result === false) {
+            throw new QueryException($statement, [], new \Exception($this->sm->error, $this->sm->errno));
+        }
+        return $result;
     }
 
     public function exec($statement)

@@ -14,14 +14,9 @@ class Laravel
     protected $app;
 
     /**
-     * @var HttpKernel $laravelKernel
+     * @var HttpKernel $kernel
      */
-    protected $laravelKernel;
-
-    /**
-     * @var \ReflectionObject $laravelReflect
-     */
-    protected $laravelReflect;
+    protected $kernel;
 
     protected static $snapshotKeys = ['config', 'cookie', 'auth', /*'auth.password'*/];
 
@@ -47,7 +42,7 @@ class Laravel
 
     public function prepareLaravel()
     {
-        $this->autoload();
+        static::autoload($this->conf['root_path']);
         $this->createApp();
         $this->createKernel();
         $this->setLaravel();
@@ -56,13 +51,13 @@ class Laravel
         $this->saveSnapshots();
     }
 
-    protected function autoload()
+    public static function autoload($rootPath)
     {
-        $autoload = $this->conf['root_path'] . '/bootstrap/autoload.php';
+        $autoload = $rootPath . '/bootstrap/autoload.php';
         if (file_exists($autoload)) {
             require_once $autoload;
         } else {
-            require_once $this->conf['root_path'] . '/vendor/autoload.php';
+            require_once $rootPath . '/vendor/autoload.php';
         }
     }
 
@@ -74,7 +69,7 @@ class Laravel
     protected function createKernel()
     {
         if (!$this->conf['is_lumen']) {
-            $this->laravelKernel = $this->app->make(HttpKernel::class);
+            $this->kernel = $this->app->make(HttpKernel::class);
         }
     }
 
@@ -125,31 +120,16 @@ class Laravel
 
     protected function saveSnapshots()
     {
-        $this->snapshots = [];
-        foreach (self::$snapshotKeys as $key) {
-            if (isset($this->app[$key])) {
-                if (is_object($this->app[$key])) {
-                    $this->snapshots[$key] = clone $this->app[$key];
-                } else {
-                    $this->snapshots[$key] = $this->app[$key];
-                }
-            }
-        }
-
-        if ($this->conf['is_lumen']) {
-            $this->laravelReflect = new \ReflectionObject($this->app);
-        }
+        $this->snapshots['config'] = $this->app['config']->all();
     }
 
     protected function applySnapshots()
     {
-        foreach ($this->snapshots as $key => $value) {
-            if (is_object($value)) {
-                $this->app[$key] = clone $value;
-            } else {
-                $this->app[$key] = $value;
+        $this->app['config']->set($this->snapshots['config']);
+        if (isset($this->app['cookie'])) {
+            foreach ($this->app['cookie']->getQueuedCookies() as $name => $cookie) {
+                $this->app['cookie']->unqueue($name);
             }
-            Facade::clearResolvedInstance($key);
         }
     }
 
@@ -172,17 +152,18 @@ class Laravel
                 $content = (string)$response;
             }
 
-            $middleware = $this->laravelReflect->getProperty('middleware');
+            $laravelReflect = new \ReflectionObject($this->app);
+            $middleware = $laravelReflect->getProperty('middleware');
             $middleware->setAccessible(true);
             if (!empty($middleware->getValue($this->app))) {
-                $callTerminableMiddleware = $this->laravelReflect->getMethod('callTerminableMiddleware');
+                $callTerminableMiddleware = $laravelReflect->getMethod('callTerminableMiddleware');
                 $callTerminableMiddleware->setAccessible(true);
                 $callTerminableMiddleware->invoke($this->app, $response);
             }
         } else {
-            $response = $this->laravelKernel->handle($request);
+            $response = $this->kernel->handle($request);
             $content = $response->getContent();
-            $this->laravelKernel->terminate($request, $response);
+            $this->kernel->terminate($request, $response);
         }
 
         // prefer content in response, secondly ob
@@ -242,7 +223,8 @@ class Laravel
     {
         if (class_exists($providerCls, false) || $force) {
             if ($this->conf['is_lumen']) {
-                $loadedProviders = $this->laravelReflect->getProperty('loadedProviders');
+                $laravelReflect = new \ReflectionObject($this->app);
+                $loadedProviders = $laravelReflect->getProperty('loadedProviders');
                 $loadedProviders->setAccessible(true);
                 $oldLoadedProviders = $loadedProviders->getValue($this->app);
                 unset($oldLoadedProviders[get_class(new $providerCls($this->app))]);

@@ -19,7 +19,10 @@ class LaravelSCommand extends Command
     {
         $this->actions = ['start', 'stop', 'restart', 'reload', 'publish'];
         $actions = implode('|', $this->actions);
-        $this->signature .= sprintf(' {action : %s}', $actions);
+        $this->signature .= sprintf(
+            ' {action : %s} {--d|daemonize : Whether run as a daemon for start & restart} {--i|ignore : Whether ignore checking process pid for start & restart}',
+            $actions
+        );
         $this->description .= ': ' . $actions;
 
         parent::__construct();
@@ -34,13 +37,18 @@ class LaravelSCommand extends Command
     {
         $action = (string)$this->argument('action');
         if (!in_array($action, $this->actions, true)) {
-            $this->warn(sprintf('LaravelS: action %s is not available, only support %s', $action, implode('|', $this->actions)));
-            return;
+            $this->warn(sprintf(
+                    'LaravelS: action %s is not available, only support %s',
+                    $action,
+                    implode('|', $this->actions)
+                )
+            );
+            return 127;
         }
 
         $this->isLumen = stripos($this->getApplication()->getVersion(), 'Lumen') !== false;
         $this->loadConfigManually();
-        $this->{$action}();
+        return $this->{$action}();
     }
 
     protected function loadConfigManually()
@@ -72,28 +80,59 @@ EOS;
         ]);
     }
 
+    protected function preSet(array &$svrConf)
+    {
+        if (!isset($svrConf['enable_gzip'])) {
+            $svrConf['enable_gzip'] = false;
+        }
+        if (empty($svrConf['laravel_base_path'])) {
+            $svrConf['laravel_base_path'] = base_path();
+        }
+        if (empty($svrConf['process_prefix'])) {
+            $svrConf['process_prefix'] = $svrConf['laravel_base_path'];
+        }
+        if (empty($svrConf['swoole']['document_root'])) {
+            $svrConf['swoole']['document_root'] = $svrConf['laravel_base_path'] . '/public';
+        }
+        if ($this->option('daemonize')) {
+            $svrConf['swoole']['daemonize'] = true;
+        }
+        if (empty($svrConf['swoole']['pid_file'])) {
+            $svrConf['swoole']['pid_file'] = storage_path('laravels.pid');
+        }
+    }
+
+    protected function preCheck(array $svrConf)
+    {
+        if (!empty($svrConf['enable_gzip']) && version_compare(\swoole_version(), '4.1.0', '>=')) {
+            $this->error('LaravelS: enable_gzip is DEPRECATED since Swoole 4.1.0, set http_compression of Swoole instead, http_compression is disabled by default.');
+            $this->info('LaravelS: if there is a proxy server like Nginx, suggest that enable gzip in Nginx and disable gzip in Swoole, to avoid the repeated gzip compression for response.');
+            return 1;
+        }
+        if (!empty($svrConf['events'])) {
+            if (empty($svrConf['swoole']['task_worker_num']) || $svrConf['swoole']['task_worker_num'] <= 0) {
+                $this->error('LaravelS: Asynchronous event listening needs to set task_worker_num > 0');
+                return 1;
+            }
+        }
+        return 0;
+    }
+
     protected function start()
     {
         $this->outputLogo();
 
         $svrConf = config('laravels');
-        $basePath = array_get($svrConf, 'laravel_base_path', base_path());
 
-        if (empty($svrConf['swoole']['document_root'])) {
-            $svrConf['swoole']['document_root'] = $basePath . '/public';
-        }
-        if (empty($svrConf['process_prefix'])) {
-            $svrConf['process_prefix'] = $basePath;
-        }
-        if (!empty($svrConf['events'])) {
-            if (empty($svrConf['swoole']['task_worker_num']) || $svrConf['swoole']['task_worker_num'] <= 0) {
-                $this->error('LaravelS: Asynchronous event listening needs to set task_worker_num > 0');
-                return;
-            }
+        $this->preSet($svrConf);
+
+        $ret = $this->preCheck($svrConf);
+        if ($ret !== 0) {
+            return $ret;
         }
 
         $laravelConf = [
-            'root_path'          => $basePath,
+            'root_path'          => $svrConf['laravel_base_path'],
             'static_path'        => $svrConf['swoole']['document_root'],
             'register_providers' => array_unique((array)array_get($svrConf, 'register_providers', [])),
             'is_lumen'           => $this->isLumen,
@@ -101,23 +140,35 @@ EOS;
             '_ENV'               => $_ENV,
         ];
 
-        if (file_exists($svrConf['swoole']['pid_file'])) {
+        if (isset($svrConf['socket_type'])
+            && in_array($svrConf['socket_type'], [\SWOOLE_SOCK_UNIX_DGRAM, \SWOOLE_SOCK_UNIX_STREAM])
+        ) {
+            $listenAt = $svrConf['listen_ip'];
+        } else {
+            $listenAt = sprintf('%s:%s', $svrConf['listen_ip'], $svrConf['listen_port']);
+        }
+
+        if (!$this->option('ignore') && file_exists($svrConf['swoole']['pid_file'])) {
             $pid = (int)file_get_contents($svrConf['swoole']['pid_file']);
-            if ($this->killProcess($pid, 0)) {
-                $this->warn(sprintf('LaravelS: PID[%s] is already running at %s:%s.', $pid, $svrConf['listen_ip'], $svrConf['listen_port']));
-                return;
+            if ($pid > 0 && $this->killProcess($pid, 0)) {
+                $this->warn(sprintf('LaravelS: PID[%s] is already running at %s.', $pid, $listenAt));
+                return 1;
             }
         }
 
+        if (!$svrConf['swoole']['daemonize']) {
+            $this->info(sprintf('LaravelS: Swoole is listening at %s, press Ctrl+C to quit.', $listenAt));
+        }
+
         // Implements gracefully reload, avoid including laravel's files before worker start
-        $cmd = sprintf('%s %s/../GoLaravelS.php', PHP_BINARY, __DIR__);
+        $cmd = sprintf('%s -c "%s" %s/../GoLaravelS.php', PHP_BINARY, php_ini_loaded_file(), __DIR__);
         $ret = $this->popen($cmd, json_encode(compact('svrConf', 'laravelConf')));
         if ($ret === false) {
             $this->error('LaravelS: popen ' . $cmd . ' failed');
-            return;
+            return 1;
         }
 
-        $pidFile = empty($svrConf['swoole']['pid_file']) ? storage_path('laravels.pid') : $svrConf['swoole']['pid_file'];
+        $pidFile = $svrConf['swoole']['pid_file'];
 
         // Make sure that master process started
         $time = 0;
@@ -125,10 +176,13 @@ EOS;
             usleep(100000);
             $time++;
         }
+
         if (file_exists($pidFile)) {
-            $this->info(sprintf('LaravelS: PID[%s] is running at %s:%s.', file_get_contents($pidFile), $svrConf['listen_ip'], $svrConf['listen_port']));
+            $this->info(sprintf('LaravelS: PID[%s] is listening at %s.', file_get_contents($pidFile), $listenAt));
+            return 0;
         } else {
             $this->error(sprintf('LaravelS: PID file[%s] does not exist.', $pidFile));
+            return 1;
         }
     }
 
@@ -148,39 +202,51 @@ EOS;
     protected function stop()
     {
         $pidFile = config('laravels.swoole.pid_file') ?: storage_path('laravels.pid');
-        if (file_exists($pidFile)) {
-            $pid = (int)file_get_contents($pidFile);
-            if ($this->killProcess($pid, 0)) {
-                if ($this->killProcess($pid, SIGTERM)) {
-                    // Make sure that master process quit
-                    $time = 0;
-                    while ($this->killProcess($pid, 0) && $time <= 20) {
-                        usleep(100000);
-                        $this->killProcess($pid, SIGTERM);
-                        $time++;
+        if (!file_exists($pidFile)) {
+            $this->info('LaravelS: already stopped.');
+            return 0;
+        }
+
+        $pid = (int)file_get_contents($pidFile);
+        if ($this->killProcess($pid, 0)) {
+            if ($this->killProcess($pid, SIGTERM)) {
+                // Make sure that master process quit
+                $time = 1;
+                $waitTime = config('laravels.swoole.max_wait_time', 60);
+                while ($this->killProcess($pid, 0)) {
+                    if ($time > $waitTime) {
+                        $this->error("LaravelS: PID[{$pid}] cannot be stopped gracefully in {$waitTime}s, will be stopped forced right now.");
+                        return 1;
                     }
-                    if (file_exists($pidFile)) {
-                        unlink($pidFile);
-                    }
-                    $this->info("LaravelS: PID[{$pid}] is stopped.");
-                } else {
-                    $this->error("LaravelS: PID[{$pid}] is stopped failed.");
+                    $this->warn("LaravelS: Waiting PID[{$pid}] to stop. [{$time}]");
+                    sleep(1);
+                    $time++;
                 }
-            } else {
-                $this->warn("LaravelS: PID[{$pid}] does not exist, or permission denied.");
                 if (file_exists($pidFile)) {
                     unlink($pidFile);
                 }
+                $this->info("LaravelS: PID[{$pid}] is stopped.");
+                return 0;
+            } else {
+                $this->error("LaravelS: PID[{$pid}] is stopped failed.");
+                return 1;
             }
         } else {
-            $this->info('LaravelS: already stopped.');
+            $this->warn("LaravelS: PID[{$pid}] does not exist, or permission denied.");
+            if (file_exists($pidFile)) {
+                unlink($pidFile);
+            }
+            return $this->option('ignore') ? 0 : 1;
         }
     }
 
     protected function restart()
     {
-        $this->stop();
-        $this->start();
+        $exitCode = $this->stop();
+        if ($exitCode !== 0) {
+            return $exitCode;
+        }
+        return $this->start();
     }
 
     protected function reload()
@@ -188,19 +254,22 @@ EOS;
         $pidFile = config('laravels.swoole.pid_file') ?: storage_path('laravels.pid');
         if (!file_exists($pidFile)) {
             $this->error('LaravelS: it seems that LaravelS is not running.');
-            return;
+            return 1;
         }
 
         $pid = (int)file_get_contents($pidFile);
         if (!$this->killProcess($pid, 0)) {
             $this->error("LaravelS: PID[{$pid}] does not exist, or permission denied.");
-            return;
+            return 1;
         }
 
         if ($this->killProcess($pid, SIGUSR1)) {
-            $this->info("LaravelS: PID[{$pid}] is reloaded.");
+            $now = date('Y-m-d H:i:s');
+            $this->info("LaravelS: PID[{$pid}] is reloaded at {$now}.");
+            return 0;
         } else {
             $this->error("LaravelS: PID[{$pid}] is reloaded failed.");
+            return 1;
         }
     }
 
@@ -212,22 +281,20 @@ EOS;
             $choice = $this->anticipate($to . ' already exists, do you want to override it ? Y/N', ['Y', 'N'], 'N');
             if (!$choice || strtoupper($choice) !== 'Y') {
                 $this->info('Publishing skipped.');
-                return;
+                return 0;
             }
         }
 
         try {
-            $this->call('vendor:publish', ['--provider' => LaravelSServiceProvider::class, '--force' => true]);
-            return;
+            return $this->call('vendor:publish', ['--provider' => LaravelSServiceProvider::class, '--force' => true]);
+        } catch (\InvalidArgumentException $e) {
+            // do nothing.
         } catch (\Exception $e) {
-            if (!($e instanceof \InvalidArgumentException)) {
-                throw $e;
-            }
+            throw $e;
         }
+
         $from = __DIR__ . '/../../config/laravels.php';
-
         $toDir = dirname($to);
-
 
         /**
          * @var Filesystem $files
@@ -245,6 +312,7 @@ EOS;
         $to = str_replace($basePath, '', realpath($to));
 
         $this->line('<info>Copied File</info> <comment>[' . $from . ']</comment> <info>To</info> <comment>[' . $to . ']</comment>');
+        return 0;
     }
 
     protected function killProcess($pid, $sig)
